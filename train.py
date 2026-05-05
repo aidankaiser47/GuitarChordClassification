@@ -2,6 +2,52 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import DataLoader
+from torchvision import models, transforms
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import LabelEncoder
+
+from guitar_chord_dataset import GuitarChordDataset
+
+
+# parts of this file were AI assisted with Claude
+
+def build_resnet18(num_classes: int, dropout_rate: float = 0.5) -> nn.Module:
+    model = models.resnet18(weights=models.ResNet18_Weights.IMAGENET1K_V1)
+
+    for param in model.parameters():
+        param.requires_grad = False
+
+    # Only fine-tune layer4 — less capacity = less overfitting on tiny datasets
+    for param in model.layer4.parameters():
+        param.requires_grad = True
+
+    model.fc = nn.Sequential(
+        nn.Dropout(p=dropout_rate),
+        nn.Linear(model.fc.in_features, num_classes)
+    )
+    return model
+
+class EarlyStopping:
+    def __init__(self, patience=7, min_delta=0.001):
+        self.patience   = patience
+        self.min_delta  = min_delta
+        self.best_loss  = float('inf')
+        self.counter    = 0
+        self.should_stop = False
+
+    def step(self, val_loss):
+        if val_loss < self.best_loss - self.min_delta:
+            self.best_loss = val_loss
+            self.counter   = 0
+        else:
+            self.counter += 1
+            if self.counter >= self.patience:
+                self.should_stop = True
+
 
 def train_one_epoch(model, loader, criterion, optimizer, device):
     """
@@ -137,37 +183,78 @@ def get_predictions(model, loader, device):
     return all_labels, all_preds
 
 
-def run_experiment(model, train_loader, val_loader, device, num_epochs=20, lr=0.001):
+def run_experiment(model, train_loader, val_loader, device,
+                   num_epochs=40, lr=0.001, weight_decay=1e-3):
     """
-    Full training loop for one experiment.
-    Args:
-        model: nn.Module, the neural network being trained
-        train_loader: DataLoader for training data
-        val_loader: DataLoader for validation data
-        device: the variable that tells PyTorch whether to run on CPU or GPU
-        num_epochs (int): number of training epochs
-        lr (float): learning rate
-    Returns:
-        history: dict with keys 'train_loss', 'val_loss', 'train_acc', 'val_acc'
+    Regularization applied here:
+      - weight_decay (L2) via AdamW
+      - label smoothing in CrossEntropyLoss
+      - cosine LR annealing
+      - early stopping
     """
-    criterion = nn.CrossEntropyLoss()
-    optimizer = optim.Adam(model.parameters(), lr=lr)
-    history = {"train_loss": [], "val_loss": [], "train_acc": [], "val_acc": []}
-    
-    for epoch in range(1, num_epochs + 1): # for however many epochs
-        # we train and then validate
-        train_loss, train_acc = train_one_epoch(model, train_loader, criterion, optimizer, device)
-        val_loss, val_acc = validate(model, val_loader, criterion, device)
+    criterion = nn.CrossEntropyLoss(label_smoothing=0.1)
+    optimizer = optim.AdamW(
+        filter(lambda p: p.requires_grad, model.parameters()),
+        lr=lr,
+        weight_decay=weight_decay   # L2 regularization
+    )
+    scheduler     = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=num_epochs)
+    early_stopper = EarlyStopping(patience=7)
 
-        # store all the losses and accuracies for later
+    history = {"train_loss": [], "train_acc": [], "val_loss": [], "val_acc": []}
+    best_val_acc = 0.0
+
+    for epoch in range(1, num_epochs + 1):
+        # ── Train ──
+        model.train()
+        t_loss, t_correct, t_total = 0.0, 0, 0
+        for imgs, labels in train_loader:
+            imgs, labels = imgs.to(device), labels.to(device)
+            optimizer.zero_grad()
+            out  = model(imgs)
+            loss = criterion(out, labels)
+            loss.backward()
+            optimizer.step()
+            t_loss    += loss.item() * imgs.size(0)
+            t_correct += (out.argmax(1) == labels).sum().item()
+            t_total   += imgs.size(0)
+
+        # validate
+        model.eval()
+        v_loss, v_correct, v_total = 0.0, 0, 0
+        with torch.no_grad():
+            for imgs, labels in val_loader:
+                imgs, labels = imgs.to(device), labels.to(device)
+                out  = model(imgs)
+                loss = criterion(out, labels)
+                v_loss    += loss.item() * imgs.size(0)
+                v_correct += (out.argmax(1) == labels).sum().item()
+                v_total   += imgs.size(0)
+
+        train_loss = t_loss / t_total
+        train_acc  = t_correct / t_total
+        val_loss   = v_loss / v_total
+        val_acc    = v_correct / v_total
+
+        scheduler.step()
+        early_stopper.step(val_loss)
+
         history["train_loss"].append(train_loss)
-        history["val_loss"].append(val_loss)
         history["train_acc"].append(train_acc)
+        history["val_loss"].append(val_loss)
         history["val_acc"].append(val_acc)
 
-        #epoch progress
-        print(f"Epoch [{epoch:>3}/{num_epochs}]  "
-              f"Train Loss: {train_loss:.2f}  Train Acc: {train_acc:.2f}  |  "
-              f"Val Loss: {val_loss:.2f}  Val Acc: {val_acc:.2f}")
+        print(f"Epoch {epoch:02d}/{num_epochs} | "
+              f"Train Loss: {train_loss:.4f} Acc: {train_acc:.3f} | "
+              f"Val Loss: {val_loss:.4f} Acc: {val_acc:.3f}")
+
+        if val_acc > best_val_acc:
+            best_val_acc = val_acc
+            torch.save(model.state_dict(), "best_model.pth")
+            print(f"  ✓ Saved best model (val_acc={val_acc:.3f})")
+
+        if early_stopper.should_stop:
+            print(f"  Early stopping triggered at epoch {epoch}")
+            break
 
     return history

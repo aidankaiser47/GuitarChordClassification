@@ -9,9 +9,6 @@ import pandas as pd
 import librosa
 import numpy as np
 
-
-#add any helper function you need here:
-
 def get_dataloaders(batch_size=128, augmentation=False, pretrained=False):
     """
     Returns CIFAR-10 train, validation, and test DataLoaders.
